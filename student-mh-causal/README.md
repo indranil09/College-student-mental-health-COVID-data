@@ -13,7 +13,7 @@ April 9 and June 3, 2020. Effects are estimated by inverse probability weighting
 XGBoost propensity scores, in the full sample and within exploratory subgroups defined by
 PTSD symptom severity, gender identity, race, and age.
 
-**Start with the vignette:** [`vignette/vignette.html`](vignette/vignette.html) walks through
+**Start with the vignette:** [view it online](https://indranil09.github.io/College-student-mental-health-COVID-data/student-mh-causal/vignette/vignette.html) (source: [`vignette/vignette.Rmd`](vignette/vignette.Rmd)). It walks through
 the data, treatment definitions, causal assumptions, weighting diagnostics, all 46 estimates
 (Tables 3 to 7), and the Benjamini and Hochberg adjustment.
 

@@ -7,4 +7,4 @@ Together, these studies demonstrate how the same student dataset can be used for
 ## Repository contents
 
 * `numeric_MHTree.csv`: dataset used in the Journal of Data Science study.
-* [`student-mh-causal/`](student-mh-causal/): data, analysis code, output, and an annotated vignette for the causal analysis of student mental health (propensity score weighting with XGBoost). See its [README](student-mh-causal/README.md).
+* [`student-mh-causal/`](student-mh-causal/): data, analysis code, output, and an annotated vignette for the causal analysis of student mental health (propensity score weighting with XGBoost). See its [README](student-mh-causal/README.md), or view the [interactive vignette](https://indranil09.github.io/College-student-mental-health-COVID-data/student-mh-causal/vignette/vignette.html) online.
