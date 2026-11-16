@@ -1,0 +1,481 @@
+---
+title: "Propensity score weighted analysis of college student mental health in early COVID-19"
+subtitle: "Companion vignette for Shearer et al., *PLOS Mental Health* (under revision)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+    theme: flatly
+    highlight: tango
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.retina = 2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+# Paths are relative to the vignette/ folder
+dat     <- read.csv("../data/numeric_GPA3_0_first.csv")
+res     <- read.csv("../output/results.csv")
+bal     <- read.csv("../output/balance.csv")
+dat$age[dat$age == 0] <- NA   # age = 0 codes a missing value
+
+alpha <- 0.10
+
+# Readable labels for treatments and subgroups (as in Tables 3 to 7)
+trt_labels <- c(
+  "GPA 3.0 or below"                                    = "GPA ≤ 3.0",
+  "PTSD score 33 or higher"                             = "PTSD score ≥ 33",
+  "COVID isolation above 7"                             = "COVID-19 isolation > 7",
+  "Three or more intense educational helpers"           = "Educational helpers ≥ 3",
+  "Maximum emotional help 9 or higher"                  = "Max. emotional help ≥ 9",
+  "Academic perseverance above median"                  = "Academic perseverance > median",
+  "Not a cisgender woman"                               = "Not a cisgender woman",
+  "Trauma score above median (higher = fewer events?)"  = "Trauma score > median",
+  "Trauma score above median (fewer traumatic events)"  = "Trauma score > median"
+)
+grp_levels <- c("Full sample", "High PTSD (>=33)", "Low PTSD (<33)",
+                "Cisgender women", "Cisgender men",
+                "White", "Asian/Asian-American", "Other racial identity",
+                "Ages 18-20", "Ages 21-24", "Ages 25+")
+grp_labels <- c("Full sample", "High PTSD symptom severity", "Low PTSD symptom severity",
+                "Cisgender women", "Cisgender men",
+                "White students", "Asian/Asian-American students", "Students of other racial identities",
+                "Ages 18–20", "Ages 21–24", "Ages 25+")
+
+res <- res %>%
+  mutate(Treatment = unname(trt_labels[treatment]),
+         Group     = factor(grp_labels[match(group, grp_levels)], levels = grp_labels))
+
+fmt_p <- function(p) ifelse(p < 1e-4, "< 0.0001", formatC(p, format = "f", digits = 4))
+```
+
+## Overview
+
+This vignette documents the analysis behind the paper and reproduces every number
+reported in its tables and supplementary materials. It is organised in the same
+order as the analysis itself.
+
+1. The analytic sample and the subgroups.
+2. The treatment contrasts and how each is coded.
+3. The causal estimand and identifying assumptions.
+4. Propensity score estimation with XGBoost and inverse probability weighting.
+5. Weighting diagnostics (Supplementary Table S2, Fig S1, S1 Data).
+6. Treatment effect estimates (Tables 3 to 7).
+7. The Benjamini and Hochberg adjustment.
+
+The model-fitting step (step 4) requires the `xgboost` R package and is run by
+`R/causal_ipw.R`, which writes the files in `output/`. This vignette reads those
+saved outputs, so it renders without refitting the models, and it recomputes from
+the raw data everything that does not depend on the fitted propensity scores.
+
+To reproduce the full analysis from scratch:
+
+```{bash, eval = FALSE}
+# from the student-mh-causal/ folder
+Rscript R/causal_ipw.R          # fits all 46 models, writes output/
+Rscript -e 'rmarkdown::render("vignette/vignette.Rmd")'
+```
+
+## 1. Data and analytic sample
+
+The data come from an online survey of students at a large public university in the
+Mid-Atlantic United States, administered between April 9 and June 3, 2020. The analytic
+sample contains **`r nrow(dat)` students**, each with complete information on all study
+variables except age, which is missing for `r sum(is.na(dat$age))` students.
+
+The outcome, `mh_scale`, is the mean of the 21 items of the Depression Anxiety Stress
+Scales (DASS-21). It ranges from 0 to 3, and higher values indicate greater psychological
+distress.
+
+```{r outcome}
+ggplot(dat, aes(mh_scale)) +
+  geom_histogram(binwidth = 0.125, boundary = 0, fill = "#2C7FB8", colour = "white") +
+  labs(x = "Mental Health Scale (DASS-21 item mean, higher = more distress)",
+       y = "Number of students",
+       title = sprintf("Outcome distribution (mean %.2f, SD %.2f)",
+                       mean(dat$mh_scale), sd(dat$mh_scale))) +
+  theme_minimal(base_size = 12)
+```
+
+### Subgroups
+
+Analyses were run in the full sample and separately within subgroups defined by PTSD
+symptom severity, gender identity, race, and age. Students identifying as gender
+minorities (n = `r sum(dat$gender == 2)`) were too few for a separate gender stratum,
+and age-stratified analyses use the `r sum(!is.na(dat$age))` students with recorded age.
+
+```{r subgroups}
+sub_n <- tibble::tribble(
+  ~Stratification, ~Subgroup, ~n,
+  "None",        "Full sample",                         nrow(dat),
+  "PTSD",        "High symptom severity (PCL-5 ≥ 33)", sum(dat$ptsd_score >= 33),
+  "PTSD",        "Low symptom severity (PCL-5 < 33)",   sum(dat$ptsd_score < 33),
+  "Gender",      "Cisgender women",                     sum(dat$gender == 0),
+  "Gender",      "Cisgender men",                       sum(dat$gender == 1),
+  "Race",        "White",                               sum(dat$race == 0),
+  "Race",        "Asian/Asian-American",                sum(dat$race == 2),
+  "Race",        "Other racial identities",             sum(dat$race == 1),
+  "Age",         "18–20",                          sum(dat$age <= 20, na.rm = TRUE),
+  "Age",         "21–24",                          sum(dat$age %in% 21:24),
+  "Age",         "25 and older",                        sum(dat$age >= 25, na.rm = TRUE)
+)
+kable(sub_n, caption = "Subgroup sample sizes") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "condensed")) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## 2. Treatment definitions
+
+Every exposure is dichotomized so that the average treatment effect (ATE) compares two
+well-defined groups of students. The table gives the exact definition of the group coded 1,
+the reason for the cutoff, and the number of treated students in the full sample,
+computed directly from the data.
+
+```{r treatments}
+trt_tab <- tibble::tribble(
+  ~Treatment, ~`Coded 1 if`, ~Justification, ~`Treated (full sample)`,
+  "GPA ≤ 3.0", "Self-reported cumulative GPA at or below 3.0",
+    "B average; standard benchmark for good academic standing", sum(dat$gpa_thresh3_0 == 1),
+  "PTSD score ≥ 33", "PCL-5 total of 33 or higher (range 0–80)",
+    "Recommended threshold for probable PTSD (Bovin et al., 2016); not a diagnosis", sum(dat$ptsd_score >= 33),
+  "COVID-19 isolation > 7", "Isolation item above 7 (0 = strongly disagree, 10 = strongly agree)",
+    "Clear agreement on a scale with neutral point 5; just above the sample median of 7", sum(dat$covid_iso > 7),
+  "Educational helpers ≥ 3", "Three or more network members giving intense educational help",
+    "Above the median of 2 intense educational helpers", sum(dat$edu.i_count >= 3),
+  "Max. emotional help ≥ 9", "Highest emotional-help rating of any network member is 9 or 10",
+    "At least one source of near-maximal emotional support", sum(dat$max.emohelp >= 9),
+  "Academic perseverance > median", sprintf("Academic perseverance above %.1f (1–6 scale)", median(dat$acpers)),
+    "Full-sample median split", sum(dat$acpers > median(dat$acpers)),
+  "Not a cisgender woman", "Gender identity other than cisgender woman",
+    "Used only within the PTSD strata", sum(dat$gender != 0),
+  "Trauma score > median", sprintf("Trauma item sum above %d", as.integer(median(dat$trauma_sum))),
+    "Full-sample median split. Higher scores mean FEWER reported traumatic experiences", sum(dat$trauma_sum > median(dat$trauma_sum))
+)
+kable(trt_tab, caption = "Treatment contrasts (group coded 0 is everyone else in the analytic sample)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 13)
+```
+
+The trauma score is scored in the reverse of what its name suggests. Its correlation
+with the PCL-5 score is `r sprintf("%.2f", cor(dat$trauma_sum, dat$ptsd_score))` and with
+the outcome `r sprintf("%.2f", cor(dat$trauma_sum, dat$mh_scale))`, so the trauma
+indicator identifies students reporting comparatively *less* trauma exposure.
+
+Which treatments are examined in which stratum:
+
+```{r plan}
+res %>%
+  distinct(Group, Treatment) %>%
+  mutate(x = "✓") %>%
+  pivot_wider(names_from = Treatment, values_from = x, values_fill = "") %>%
+  kable(caption = "Analysis plan: 46 treatment effects in 11 analytic samples") %>%
+  kable_styling(bootstrap_options = c("condensed"), font_size = 12)
+```
+
+## 3. Causal framework
+
+Each student $i$ has two potential outcomes, $Y_i(1)$ under treatment and $Y_i(0)$
+without it, and the estimand is the average treatment effect
+
+$$\text{ATE} = \mathbb{E}\left[Y(1) - Y(0)\right].$$
+
+The ATE is identified from observational data under three assumptions.
+
+* **Consistency.** The observed outcome equals the potential outcome under the treatment received.
+* **Conditional exchangeability.** Given the measured covariates, treatment assignment is independent of the potential outcomes, so there is no unmeasured confounding.
+* **Positivity.** Every student has a probability strictly between 0 and 1 of being in either group.
+
+The assumed causal structure is shown below with GPA as the treatment. The same structure
+is assumed for every other treatment, with the focal treatment taking the place of GPA and
+all other measured variables treated as common causes of the treatment and the outcome.
+
+```{r dag, fig.width = 8, fig.height = 4.2}
+nodes <- data.frame(
+  name = c("Demographics\n(age, gender, race,\nfirst generation)",
+           "Academic context\n(field of study,\nhours worked)",
+           "Support network\n(structure, closeness,\nhelp received)",
+           "Perceived support\n(MSPSS, community)",
+           "Psychosocial\n(perseverance, PTSD,\ntrauma, isolation)",
+           "GPA ≤ 3.0", "Mental health\n(DASS-21)"),
+  x = c(1, 2.5, 4, 5.5, 7, 2.5, 5.5),
+  y = c(3, 3, 3, 3, 3, 1, 1),
+  type = c(rep("Covariate", 5), "Treatment", "Outcome"))
+edges <- rbind(
+  data.frame(x = nodes$x[1:5], y = 2.72, xend = 2.62, yend = 1.3),
+  data.frame(x = nodes$x[1:5], y = 2.72, xend = 5.38, yend = 1.3),
+  data.frame(x = 3.15, y = 1, xend = 4.65, yend = 1))
+ggplot() +
+  geom_segment(data = edges, aes(x, y, xend = xend, yend = yend),
+               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               colour = "grey55", linewidth = 0.4) +
+  geom_label(data = nodes, aes(x, y, label = name, fill = type), key_glyph = "rect",
+             size = 3, label.padding = unit(0.3, "lines"), colour = "grey15") +
+  scale_fill_manual(values = c(Covariate = "#EDF3F8", Treatment = "#FDD49E", Outcome = "#C7E9C0"),
+                    name = NULL) +
+  coord_cartesian(xlim = c(0.3, 7.7), ylim = c(0.5, 3.6)) +
+  theme_void(base_size = 11) + theme(legend.position = "bottom")
+```
+
+For each treatment, the propensity score model uses **all measured variables except**
+the outcome, the self-reported effect of COVID-19 on mental health (`covid_mh`, a proxy for
+the outcome), and the variable the treatment is built from. Because all variables were
+measured in the same survey, some covariates may act as mediators for some treatments, and
+the estimates should be read as effects under the stated assumptions.
+
+## 4. Propensity scores and weights
+
+Propensity scores $\hat p_i = \Pr(D_i = 1 \mid \mathbf{x}_i)$ are estimated with XGBoost,
+separately within each analytic sample. The settings are deliberately conservative for
+samples of this size.
+
+```{r xgb-settings, echo = FALSE}
+tibble::tribble(
+  ~Setting, ~Value,
+  "Objective", "binary:logistic (log loss)",
+  "Learning rate (eta)", "0.05",
+  "Maximum tree depth", "2",
+  "Minimum child weight", "5",
+  "Row and column subsampling", "0.8",
+  "Number of rounds", "5-fold cross-validation, early stopping after 25 rounds, maximum 1000",
+  "Final model", "Refit on the full analytic sample with the selected number of rounds",
+  "Missing values (age only)", "Handled natively (learned default split direction)"
+) %>% kable() %>% kable_styling(full_width = FALSE, bootstrap_options = "condensed")
+```
+
+The core of the estimation in `R/causal_ipw.R`:
+
+```{r core-code, eval = FALSE, echo = TRUE, class.source = "fold-show"}
+# Propensity scores, in the original row order
+dall <- xgboost::xgb.DMatrix(data.matrix(X), label = D, missing = NA)
+cv   <- xgboost::xgb.cv(params = xgb_params, data = dall, nrounds = 1000,
+                        nfold = 5, early_stopping_rounds = 25, verbose = 0)
+best <- which.min(cv$evaluation_log$test_logloss_mean)
+fit  <- xgboost::xgb.train(params = xgb_params, data = dall, nrounds = best)
+p    <- predict(fit, dall)
+
+# Unstabilized, untruncated ATE weights
+w <- ifelse(D == 1, 1 / p, 1 / (1 - p))
+
+# Weighted least squares of the outcome on the treatment, HC2 standard errors
+est <- estimatr::lm_robust(mh_scale ~ D, weights = w, se_type = "HC2", alpha = 0.10)
+```
+
+Because the treatment is the only regressor, the coefficient on `D` equals the
+weighted difference in mean outcomes between the two groups, which is the IPW estimate of
+the ATE. "Robust" refers only to the HC2 sandwich standard errors. Stabilizing the weights
+would rescale them by a constant within each arm and leave the estimate unchanged.
+
+## 5. Weighting diagnostics
+
+### Balance, weights, and effective sample size (Supplementary Table S2)
+
+Balance is measured by standardized mean differences (SMD), using the pooled standard
+deviation of the two groups *before* weighting as the denominator, so that the before and
+after columns are on the same scale. An absolute SMD below 0.1 indicates adequate balance.
+
+```{r diag-table}
+diag <- res %>%
+  arrange(Group) %>%
+  transmute(Group, Treatment,
+            `Treated / control` = paste(n_treated, n_control, sep = " / "),
+            `PS range` = sprintf("%.2f–%.2f", ps_min, ps_max),
+            `Weight range` = sprintf("%.2f–%.2f", weight_min, weight_max),
+            `ESS treated / control` = sprintf("%.0f / %.0f", ess_treated, ess_control),
+            `Max |SMD| before` = round(max_abs_smd_before, 2),
+            `Max |SMD| after`  = round(max_abs_smd_after, 2),
+            `|SMD| > 0.1 before / after` = paste(n_smd_over_cutoff_before, n_smd_over_cutoff_after, sep = " / "))
+kable(diag, caption = "Weighting diagnostics for all 46 analyses") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 12) %>%
+  collapse_rows(columns = 1, valign = "top") %>%
+  scroll_box(height = "520px")
+```
+
+Across all analyses, the weights range from **`r sprintf("%.2f", min(res$weight_min))`
+to `r sprintf("%.2f", max(res$weight_max))`**, and no propensity score is below
+`r sprintf("%.3f", min(res$ps_min))` or above `r sprintf("%.3f", max(res$ps_max))`,
+so there are no extreme weights. Weighting reduces imbalance, but some covariates retain
+absolute SMDs above 0.1 in every analysis, which the paper acknowledges as a limitation.
+
+### Covariate balance in the full sample
+
+The plot shows, for each full-sample treatment, the 12 covariates with the largest
+imbalance before weighting (all SMDs are in `output/balance.csv`, provided as S1 Data).
+
+```{r love-plot, fig.width = 9, fig.height = 7}
+full_bal <- bal %>%
+  filter(group == "Full sample") %>%
+  mutate(Treatment = unname(trt_labels[treatment])) %>%
+  group_by(Treatment) %>%
+  slice_max(abs(smd_before), n = 12) %>%
+  ungroup() %>%
+  pivot_longer(c(smd_before, smd_after), names_to = "when", values_to = "smd") %>%
+  mutate(when = factor(when, c("smd_before", "smd_after"), c("Before weighting", "After weighting")),
+         covariate = reorder(paste(covariate, Treatment, sep = "___"), abs(smd)))
+ggplot(full_bal, aes(abs(smd), covariate, colour = when)) +
+  geom_vline(xintercept = 0.1, linetype = "dashed", colour = "grey50") +
+  geom_line(aes(group = covariate), colour = "grey80") +
+  geom_point(size = 2.2) +
+  scale_y_discrete(labels = function(x) sub("___.*$", "", x)) +
+  scale_colour_manual(values = c("#D95F02", "#1B9E77"), name = NULL) +
+  facet_wrap(~ Treatment, scales = "free_y") +
+  labs(x = "Absolute standardized mean difference", y = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "top")
+```
+
+### Overlap of propensity scores (Supplementary Fig S1)
+
+Each panel shows the distribution of propensity scores among treated students (dark, upward)
+and comparison students (light, downward). Overlap is good for most treatments and more
+limited for PTSD symptom severity and educational help.
+
+```{r overlap, echo = FALSE, out.width = "100%"}
+knitr::include_graphics(sprintf("figures/overlap-%d.png", 1:4))
+```
+
+### A note on the smallest subgroups
+
+In several small subgroups, cross-validation selected a model whose propensity scores
+barely vary. In those analyses the weights are nearly constant within each arm, so the
+weighted estimate is essentially the unadjusted difference in means. They are listed below
+for transparency.
+
+```{r flat-ps}
+res %>%
+  filter(ps_max - ps_min < 0.02) %>%
+  transmute(Group, Treatment, n, `Treated / control` = paste(n_treated, n_control, sep = " / "),
+            `PS range` = sprintf("%.3f–%.3f", ps_min, ps_max),
+            `Weighted estimate` = round(estimate, 4),
+            `Unadjusted difference` = round(raw_difference, 4)) %>%
+  kable(caption = "Analyses with nearly constant propensity scores") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 12)
+```
+
+## 6. Treatment effect estimates (Tables 3 to 7)
+
+Estimates are in units of the Mental Health Scale (0 to 3). A positive estimate means the
+treated group has *more* distress, and a negative estimate means *less* distress. The tables
+report unadjusted p-values, Benjamini and Hochberg (BH) adjusted p-values, and 90% confidence
+intervals. Rows significant after adjustment are in **bold**; rows significant only before
+adjustment are in *italics*.
+
+```{r result-tables, results = "asis"}
+make_table <- function(groups, caption) {
+  d <- res %>% filter(Group %in% groups) %>% arrange(Group)
+  out <- d %>% transmute(Group, Treatment,
+                         Estimate = sprintf("%.4f", estimate),
+                         `P-value` = fmt_p(p_value),
+                         `BH p-value` = fmt_p(p_value_BH),
+                         `90% CI` = sprintf("(%.4f, %.4f)", ci_lower, ci_upper))
+  k <- kable(out %>% select(-Group), caption = caption, align = "lrrrr") %>%
+    kable_styling(full_width = FALSE, bootstrap_options = c("condensed", "hover"))
+  bold <- which(d$p_value_BH < alpha); ital <- which(d$p_value < alpha & d$p_value_BH >= alpha)
+  if (length(bold)) k <- row_spec(k, bold, bold = TRUE)
+  if (length(ital)) k <- row_spec(k, ital, italic = TRUE)
+  for (g in unique(as.character(d$Group))) {
+    idx <- which(as.character(d$Group) == g)
+    if (length(groups) > 1) k <- pack_rows(k, g, min(idx), max(idx))
+  }
+  print(k)
+}
+make_table("Full sample", "Table 3. Full sample")
+make_table(c("High PTSD symptom severity", "Low PTSD symptom severity"), "Table 4. Stratified by PTSD symptom severity")
+make_table(c("Cisgender women", "Cisgender men"), "Table 5. Stratified by gender identity")
+make_table(c("White students", "Asian/Asian-American students", "Students of other racial identities"),
+           "Table 6. Stratified by race")
+make_table(c("Ages 18–20", "Ages 21–24", "Ages 25+"), "Table 7. Stratified by age")
+```
+
+### All 46 estimates at a glance
+
+```{r forest, fig.width = 10, fig.height = 11}
+res %>%
+  mutate(sig = case_when(p_value_BH < alpha ~ "Significant after BH adjustment",
+                         p_value < alpha    ~ "Significant before adjustment only",
+                         TRUE               ~ "Not significant"),
+         sig = factor(sig, c("Significant after BH adjustment",
+                             "Significant before adjustment only", "Not significant"))) %>%
+  ggplot(aes(estimate, reorder(Treatment, estimate), colour = sig)) +
+  geom_vline(xintercept = 0, colour = "grey50") +
+  geom_errorbarh(aes(xmin = ci_lower, xmax = ci_upper), height = 0.25) +
+  geom_point(size = 2) +
+  facet_wrap(~ Group, ncol = 3, scales = "free_y", labeller = label_wrap_gen(28)) +
+  scale_colour_manual(values = c("#08519C", "#6BAED6", "grey65"), name = NULL) +
+  labs(x = "Estimated effect on the Mental Health Scale (90% CI)", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "top", strip.text = element_text(face = "bold"))
+```
+
+Two patterns stand out. PTSD symptom severity is associated with substantially greater
+distress in the full sample and in every gender, racial, and age subgroup in which it was
+examined, and having three or more educational helpers is associated with less distress in
+the full sample and most subgroups. The subgroup analyses are exploratory and the subgroups
+were not formally compared.
+
+### Checks on the reported intervals
+
+Every 90% confidence interval is symmetric about its estimate, with half-width equal to
+the 95th percentile of the $t$ distribution with $n - 2$ degrees of freedom times the HC2
+standard error, as computed by `estimatr::lm_robust`.
+
+```{r ci-check}
+res %>%
+  summarise(`Max |midpoint - estimate|` = max(abs((ci_lower + ci_upper) / 2 - estimate)),
+            `Max |half-width - t x SE|` = max(abs((ci_upper - ci_lower) / 2 -
+                                                qt(1 - alpha / 2, n - 2) * std_error))) %>%
+  kable(digits = 8) %>% kable_styling(full_width = FALSE)
+```
+
+## 7. The Benjamini and Hochberg adjustment
+
+The BH procedure controls the false discovery rate across all $m = 46$ estimates. With the
+unadjusted p-values sorted as $p_{(1)} \le \dots \le p_{(m)}$, the adjusted value at rank $i$ is
+
+$$\tilde p_{(i)} = \min_{j \ge i} \left\{ \frac{m}{j}\, p_{(j)} \right\},$$
+
+capped at 1. The step below recomputes the adjustment from the unadjusted p-values and
+confirms that it matches the values in the tables.
+
+```{r bh-check, echo = TRUE, class.source = "fold-show"}
+bh <- p.adjust(res$p_value, method = "BH")
+all.equal(bh, res$p_value_BH)
+```
+
+The table shows ranks 13 to 22, where the running minimum matters. At ranks 13, 20 and 21
+the raw value $m\,p_{(i)}/i$ is larger than a value at a higher rank, so the adjusted
+p-value is pulled down to that later value. This is why several rows in Tables 4 to 6
+share an adjusted p-value of 0.1034.
+
+```{r bh-example}
+m <- nrow(res)
+res %>%
+  arrange(p_value) %>%
+  mutate(Rank = row_number(), `m p / rank` = p_value * m / Rank) %>%
+  slice(13:22) %>%
+  transmute(Rank, Group, Treatment, `P-value` = round(p_value, 4),
+            `m p / rank` = round(`m p / rank`, 4), `BH p-value` = round(p_value_BH, 4)) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 12)
+```
+
+For example, isolation in the full sample has an unadjusted p-value of 0.0360 at rank 18,
+so its adjusted p-value is $0.0360 \times 46 / 18 = 0.0920$, which remains below
+$\alpha = 0.10$.
+
+## Session information
+
+The models in `output/` were fitted with the following software (from
+`output/session_info.txt`).
+
+```{r session, echo = FALSE, comment = ""}
+si <- readLines("../output/session_info.txt")
+cat(si[c(1, grep("xgboost|estimatr", si))], sep = "\n")
+```
+
+This vignette was rendered with `r R.version.string`.
